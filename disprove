@@ -1,0 +1,88 @@
+
+# get counts matrix
+scdata <- nih3t3[["RNA"]]$counts
+scdata <- scdata[rowSums2(scdata) > 0,]
+
+# gene and cell attributes
+gene_mean <- rowMeans2(scdata)
+ltotal_counts <- log(colSums2(scdata))
+init_lfraction <- log(rowMeans2(t(t(scdata) / exp(ltotal_counts) )))
+
+# subset counts matrix
+lgene_mean_dens <- density(log(gene_mean))
+sampling_prob <- 1 / (approx(x=lgene_mean_dens$x, y=lgene_mean_dens$y, xout=log(gene_mean))$y + 1e-15)
+subset_genes <- sample(1:nrow(scdata), 5, prob = sampling_prob)
+
+mat <- scdata[subset_genes,]
+init_lfraction <- init_lfraction[subset_genes]
+
+# model
+model1 <- cmdstan_model("/home/todd/Code/Single Cell Analyses/Code Snippets/Normalization/negbinom_v1.stan")
+
+# generate cluster
+n_threads <- 8
+node_gene_bins <- cut(x = 1:nrow(mat), breaks = n_threads, labels = F)
+cl <- parallel::makeCluster(n_threads)
+
+# load constants into cluster
+parallel::clusterEvalQ(cl, { # Packages
+  library(Matrix)
+  library(cmdstanr)
+  NULL
+})
+parallel::clusterExport(cl, list("ltotal_counts", "model1"))
+
+# load variables into nodes
+sapply(1:n_threads, function(i) {
+  parallel::clusterCall(cl[i], function(scdata, init_lfraction) {
+    assign("scdata", scdata, pos = .GlobalEnv)
+    assign("init_lfraction", init_lfraction, pos = .GlobalEnv)
+    
+  },  mat[node_gene_bins == i,], # subset of counts matrix
+      init_lfraction[node_gene_bins == i] # subset of initial logged fractions guesstimates
+      )
+  NULL
+})
+
+# calculate estimates
+estimates <- parallel::clusterEvalQ(cl, {
+  post <- lapply(1:nrow(scdata), function(i) {
+    # slice matrix
+    vec <- scdata[i,]
+    
+    data1 <- list("Ncells" = length(vec),
+                  "counts" = vec,
+                  "ltotal_counts" = ltotal_counts,
+                  "init_lfraction" = init_lfraction[i])
+    
+    post1 <- model1$sample(data = data1, chains = 2, parallel_chains = 2, iter_sampling = 1500, iter_warmup = 1000,
+                           init = function() list(lfraction = data1$init_lfraction, theta = 100))
+    
+    draws <- post1$draws(variables = c("lfraction", "theta"), format = "df")
+    
+    df <- data.frame(mean = c( mean(draws$lfraction), mean(draws$theta) ),
+                     sd = c( sd(draws$lfraction), sd(draws$theta) ),
+                     p5 = c( quantile(draws$lfraction, 0.05), quantile(draws$theta, 0.05) ),
+                     p95 = c( quantile(draws$lfraction, 0.9), quantile(draws$theta, 0.9) ),
+                     row.names = c("lfraction", "theta")
+    )
+    #post1 <- model1$optimize(data = data1, init = function() list(lfraction = data1$init_lfraction, theta = 100))
+    
+    return(df)
+  })
+  
+  return(post)
+})
+parallel::stopCluster(cl)
+
+estimates <- unlist(estimates, recursive = FALSE)
+estimates <- do.call(rbind, estimates)
+lfraction <- estimates[seq(1,nrow(estimates), 2),]
+theta <- estimates[seq(2,nrow(estimates), 2),]
+
+rownames(theta) <- rownames(lfraction) <- rownames(scdata)[subset_genes]
+
+ggplot(data.frame(cbind(lfraction, theta)), mapping = aes(mean, y = mean.1)) + 
+  geom_point() + scale_y_continuous(trans='log10') +
+  geom_errorbar(aes(ymin=p5.1, ymax=p95.1)) + # geom_ribbon(aes(ymin=p5.1, ymax=p95.1), alpha=0.2)
+  theme_bw()
